@@ -1,0 +1,440 @@
+// Corridor — data model
+// Money is stored as integer cents (EUR). Percentages as basis points (1300 = 13.00%).
+// Enums are modelled as String + TS unions (keeps SQLite trivial now; ports to Postgres later).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & orgs
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  passwordHash  String
+  name          String
+  phone         String?
+  role          String   @default("CLIENT") // ADMIN | PARTNER | CLIENT | STAFF
+  orgId         String?
+  org           Organization? @relation("OrgMembers", fields: [orgId], references: [id], onDelete: SetNull)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  listings           Listing[]           @relation("ListingCreator")
+  documents          Document[]          @relation("DocUploader")
+  documentsVerified  Document[]          @relation("DocVerifier")
+  deploymentsCreated Deployment[]       @relation("DeploymentCreator")
+  invoicesIssued     Invoice[]           @relation("InvoiceIssuer")
+  bookingRequests    BookingRequest[]   @relation("BookingRequester")
+  auditLogs          AuditLog[]
+  accreditations     VendorAccreditation[] @relation("AccreditationReviewer")
+
+  @@index([orgId])
+  @@index([role])
+}
+
+model Organization {
+  id                       String   @id @default(cuid())
+  type                     String   @default("PARTNER") // PARTNER | CLIENT
+  name                     String
+  legalName                String?
+  country                  String   @default("DE")
+  vatId                    String?
+  contactEmail             String
+  phone                    String?
+  description              String?
+  website                  String?
+  addressLine              String?
+  postalCode               String?
+  city                     String?
+  region                   String?
+  // accreditation lifecycle for the org as a whole
+  accreditationStatus      String   @default("PENDING") // PENDING | NOT_STARTED | IN_REVIEW | CONDITIONAL | APPROVED | REJECTED | SUSPENDED
+  accreditationStartedAt   DateTime?
+  accreditationExpectedDays Int?
+  accreditationCompletedAt DateTime?
+  takeRateOverrideBps      Int?     // optional client-specific blended take override
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  members          User[]                 @relation("OrgMembers")
+  listings         Listing[]
+  documents        Document[]
+  deployments      Deployment[]           @relation("ClientOrg")
+  bookings         BookingRequest[]       @relation("ClientBookingOrg")
+  partnerBookings  BookingRequest[]       @relation("PartnerBookingOrg")
+  partnerDeployments Deployment[]         @relation("PartnerDeploymentOrg")
+  deploymentSites  DeploymentSite[]       @relation("PartnerOrgSite")
+  invoices         Invoice[]              @relation("ClientInvoiceOrg")
+  payouts          Payout[]              @relation("PayoutPartner")
+  accreditationsAsClient  VendorAccreditation[] @relation("AccreditationClient")
+  accreditationsAsPartner VendorAccreditation[] @relation("AccreditationPartner")
+
+  @@index([type])
+  @@index([country])
+}
+
+// ---------------------------------------------------------------------------
+// Reference catalogue of European EPC project sites (used to geotag listings)
+// ---------------------------------------------------------------------------
+
+model ProjectSite {
+  id             String   @id @default(cuid())
+  code           String   @unique // e.g. "DE-BRK-WS", "AWS-FRA20"
+  name           String
+  type           String   // WIND_OFFSHORE | WIND_ONSHORE | SOLAR | DATACENTER | SUBSTATION | HYDRO | H2 | GRID | PORT
+  country        String
+  region         String?
+  lat            Float
+  lng            Float
+  capacityMw     Int?
+  ownerOrDeveloper String?
+  description    String?
+  createdAt      DateTime @default(now())
+
+  listings       Listing[]
+
+  @@index([type])
+  @@index([country])
+}
+
+// ---------------------------------------------------------------------------
+// Listings (supply) — structured secure-infrastructure spec, not free text
+// ---------------------------------------------------------------------------
+
+model Listing {
+  id                     String   @id @default(cuid())
+  orgId                  String
+  org                    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  createdById            String
+  createdBy              User       @relation("ListingCreator", fields: [createdById], references: [id])
+
+  title                  String
+  description            String
+  propertyType           String   // HOUSE | FARMHOUSE | APARTMENT_BLOCK | AGRI_BUILDING | COMMERCIAL_UNIT | MODULAR_CAMP
+  country                String   @default("DE")
+  region                 String?
+  city                   String?
+  postalCode             String?
+  addressLine            String?
+  lat                    Float?
+  lng                    Float?
+  nearbyProjectType      String?  // mirrors ProjectSite.type
+  nearbyProjectId        String?
+  nearbyProject          ProjectSite? @relation(fields: [nearbyProjectId], references: [id], onDelete: SetNull)
+  nearbyProjectName      String?
+  distanceToProjectKm    Float?
+
+  // capacity
+  sleepsTotal            Int
+  bedrooms               Int
+  bathrooms              Int
+
+  // secure infrastructure — the wedge
+  parkingType            String   @default("NONE")     // NONE | OPEN | FENCED | BARN | GRAIN_STORE | MACHINERY_SHED | LAYDOWN_YARD
+  parkingSpaces          Int      @default(0)
+  parkingLoadRatingT     Float?   // tonnes axle load
+  storageClass           String   @default("NONE")     // NONE | BASIC | SECURE | INSURED_SECURE
+  storageAreaSqm         Int      @default(0)
+  hasFencedYard          Boolean  @default(false)
+  hasInsuredOutbuilding  Boolean  @default(false)
+  hasHeavyVehicleAccess  Boolean  @default(false)
+  hasLaydownYard         Boolean  @default(false)
+  hasThreePhasePower     Boolean  @default(false)
+  hasWorkshop            Boolean  @default(false)
+  hasLaundry             Boolean  @default(false)
+  hasMessRoom            Boolean  @default(false)
+  hasWifi                Boolean  @default(false)
+  hasCCTV                Boolean  @default(false)
+
+  // insurance / compliance posture
+  insuranceStatus        String   @default("NONE")     // NONE | SELF_INSURED | INSURED
+  insuranceProvider      String?
+  insuranceAmountEurCents Int?
+
+  // pricing
+  monthlyRateCents        Int      @default(0)         // housing-only base, per whole unit / month
+  infraPremiumCents      Int      @default(0)         // secured-infrastructure premium per month
+  minStayMonths           Int      @default(1)
+  maxStayMonths           Int      @default(18)
+
+  // lifecycle
+  status                 String   @default("DRAFT")   // DRAFT | PENDING_REVIEW | LIVE | SUSPENDED | ARCHIVED
+  publishedAt            DateTime?
+  images                 String?  // JSON: string[] of stored file paths (SQLite-safe)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  deploymentSites        DeploymentSite[]
+  bookingRequests        BookingRequest[]
+
+  @@index([orgId])
+  @@index([status])
+  @@index([country])
+  @@index([nearbyProjectType])
+}
+
+// ---------------------------------------------------------------------------
+// Compliance document vault (per host / per client / per listing)
+// ---------------------------------------------------------------------------
+
+model Document {
+  id            String   @id @default(cuid())
+  ownerType     String   // PARTNER | CLIENT | LISTING
+  ownerId       String   // orgId or listingId depending on ownerType
+  orgId         String?
+  org           Organization? @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  category      String   // INSURANCE_CERT | PUBLIC_LIABILITY | EMPLOYER_LIABILITY | SAFETY_ATTESTATION | BACKGROUND_CHECK | FIRE_SAFETY | GAS_ELEC_CERT | FOOD_HYGIENE | ISO_45001 | ISO_9001 | ACCREDITATION | CONTRACT | OTHER
+  title         String
+  fileName      String
+  storagePath   String
+  mimeType      String
+  sizeBytes     Int
+  issuedAt      DateTime?
+  expiresAt     DateTime?
+  status        String   @default("PENDING") // PENDING | VERIFIED | EXPIRING_SOON | EXPIRED | REJECTED
+  uploadedById   String?
+  uploadedBy    User?     @relation("DocUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
+  verifiedById   String?
+  verifiedBy    User?     @relation("DocVerifier", fields: [verifiedById], references: [id], onDelete: SetNull)
+  verifiedAt    DateTime?
+  notes         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([ownerType, ownerId])
+  @@index([orgId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Crew deployments — the unit that actually matters to EPC procurement
+// ---------------------------------------------------------------------------
+
+model Deployment {
+  id                          String   @id @default(cuid())
+  deploymentCode              String   @unique
+  clientOrgId                 String
+  clientOrg                   Organization @relation("ClientOrg", fields: [clientOrgId], references: [id], onDelete: Cascade)
+  createdByUserId             String
+  createdBy                   User       @relation("DeploymentCreator", fields: [createdByUserId], references: [id])
+
+  projectName                 String
+  projectType                 String   // WIND_OFFSHORE | WIND_ONSHORE | SOLAR | DATACENTER | SUBSTATION | HYDRO | H2 | GRID | MIXED
+  projectCountry              String   @default("DE")
+  projectRegion               String?
+  crewSize                    Int
+  roleMix                     String?  // JSON: {electricians: 12, riggers: 8, ...}
+  startDate                   DateTime
+  endDate                     DateTime
+  housingBudgetCentsPerPersonMonth Int?
+
+  // matching
+  partnerOrgId                String?
+  partnerOrg                  Organization? @relation("PartnerDeploymentOrg", fields: [partnerOrgId], references: [id], onDelete: SetNull)
+
+  // computed economics (snapshot)
+  totalGrossCents             Int?
+  corridorTakeCents           Int?
+  corridorSaasFeeCents       Int?
+  totalNetToCorridorCents     Int?
+
+  status                      String   @default("DRAFT") // DRAFT | REQUESTED | QUOTE_SENT | CONTRACTED | ACTIVE | COMPLETED | CANCELLED
+  notes                       String?
+  createdAt                   DateTime @default(now())
+  updatedAt                   DateTime @updatedAt
+
+  sites                       DeploymentSite[]
+  invoices                    Invoice[]
+  bookingRequests             BookingRequest[]
+
+  @@index([clientOrgId])
+  @@index([status])
+  @@index([projectType])
+}
+
+model DeploymentSite {
+  id                String   @id @default(cuid())
+  deploymentId      String
+  deployment        Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  listingId         String
+  listing           Listing    @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  partnerOrgId      String
+  partnerOrg        Organization @relation("PartnerOrgSite", fields: [partnerOrgId], references: [id], onDelete: Cascade)
+
+  bedsAllocated     Int
+  monthlyRateCents  Int
+  infraPremiumCents Int
+  commissionBps     Int       @default(900)
+  enterpriseTakeBps Int       @default(1300)
+  startDate         DateTime
+  endDate           DateTime
+  status            String   @default("QUOTE") // QUOTE | CONFIRMED | ACTIVE | COMPLETED | CANCELLED
+  grossCents        Int?
+  partnerNetCents   Int?
+  corridorCents     Int?
+  createdAt         DateTime @default(now())
+
+  @@index([deploymentId])
+  @@index([listingId])
+  @@index([partnerOrgId])
+}
+
+model BookingRequest {
+  id                  String   @id @default(cuid())
+  listingId           String
+  listing             Listing   @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  deploymentId        String?
+  deployment          Deployment? @relation(fields: [deploymentId], references: [id], onDelete: SetNull)
+  clientOrgId        String
+  clientOrg           Organization @relation("ClientBookingOrg", fields: [clientOrgId], references: [id], onDelete: Cascade)
+  partnerOrgId        String
+  partnerOrg          Organization @relation("PartnerBookingOrg", fields: [partnerOrgId], references: [id], onDelete: Cascade)
+  requestedByUserId   String
+  requestedBy         User      @relation("BookingRequester", fields: [requestedByUserId], references: [id])
+
+  status              String   @default("REQUESTED") // REQUESTED | PARTNER_ACCEPTED | PARTNER_DECLINED | COUNTERED | WITHDRAWN | CONTRACTED
+  requestedMoveIn     DateTime
+  requestedMoveOut    DateTime
+  headcount           Int
+  proposedMonthlyCents Int?
+  counterMonthlyCents Int?
+  message             String?
+  createdAt           DateTime @default(now())
+  respondedAt         DateTime?
+
+  @@index([listingId])
+  @@index([clientOrgId])
+  @@index([partnerOrgId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Consolidated multi-site invoicing (the headline procurement feature)
+// ---------------------------------------------------------------------------
+
+model Invoice {
+  id                      String   @id @default(cuid())
+  invoiceNumber           String   @unique
+  clientOrgId             String
+  clientOrg               Organization @relation("ClientInvoiceOrg", fields: [clientOrgId], references: [id], onDelete: Cascade)
+  deploymentId            String?
+  deployment              Deployment? @relation(fields: [deploymentId], references: [id], onDelete: SetNull)
+  issuedById              String?
+  issuedBy                User?     @relation("InvoiceIssuer", fields: [issuedById], references: [id], onDelete: SetNull)
+
+  billingPeriodStart      DateTime
+  billingPeriodEnd        DateTime
+  status                  String   @default("DRAFT") // DRAFT | ISSUED | PARTIAL | PAID | OVERDUE | VOID
+  subtotalCents           Int      @default(0)      // host gross (housing + infra)
+  corridorTakeCents       Int      @default(0)      // enterprise take (12-15%)
+  corridorSaasFeeCents    Int      @default(0)      // per-site compliance/billing subscription
+  vatBps                  Int      @default(1900)
+  vatCents                Int      @default(0)
+  totalCents              Int      @default(0)      // what the client pays
+  lineItems               String?                     // JSON: [{siteId, listingTitle, beds, days, rateCents, infraCents, grossCents, takeBps, takeCents, saasCents}]
+  issuedAt                DateTime?
+  dueAt                   DateTime?
+  paidAt                  DateTime?
+  notes                   String?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  payouts                 Payout[]
+
+  @@index([clientOrgId])
+  @@index([deploymentId])
+  @@index([status])
+}
+
+model Payout {
+  id            String   @id @default(cuid())
+  partnerOrgId  String
+  partnerOrg    Organization @relation("PayoutPartner", fields: [partnerOrgId], references: [id], onDelete: Cascade)
+  invoiceId     String
+  invoice       Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  grossCents    Int       @default(0)
+  commissionCents Int    @default(0)
+  netCents      Int       @default(0)
+  status        String    @default("PENDING") // PENDING | SCHEDULED | PAID | FAILED
+  scheduledFor  DateTime?
+  paidAt        DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([partnerOrgId])
+  @@index([invoiceId])
+}
+
+// ---------------------------------------------------------------------------
+// Vendor accreditation — the moat (EPC approved-supplier list cycle)
+// ---------------------------------------------------------------------------
+
+model VendorAccreditation {
+  id                     String   @id @default(cuid())
+  clientOrgId            String   // the EPC firm / hyperscaler
+  clientOrg              Organization @relation("AccreditationClient", fields: [clientOrgId], references: [id], onDelete: Cascade)
+  partnerOrgId           String   // the supply partner / vendor
+  partnerOrg             Organization @relation("AccreditationPartner", fields: [partnerOrgId], references: [id], onDelete: Cascade)
+  status                 String   @default("NOT_STARTED") // NOT_STARTED | IN_REVIEW | CONDITIONAL | APPROVED | REJECTED | SUSPENDED
+  cycleStartedAt         DateTime?
+  expectedDurationDays   Int      @default(270)   // ~9 months default (6-12 band)
+  targetCompletionAt     DateTime?
+  completedAt            DateTime?
+  reviewerUserId         String?
+  reviewer               User?    @relation("AccreditationReviewer", fields: [reviewerUserId], references: [id], onDelete: SetNull)
+  requiredDocCategories  String?  // JSON: which vault categories must be verified per this client
+  notes                  String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  @@unique([clientOrgId, partnerOrgId])
+  @@index([partnerOrgId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Take-rate + SaaS-fee control (admin-tunable, single active row)
+// ---------------------------------------------------------------------------
+
+model TakeRateConfig {
+  id                          String   @id @default(cuid())
+  hostCommissionBps           Int      @default(900)   // 9.00%
+  hostWaiveFirst90Days        Boolean  @default(true)  // cold-start supply
+  enterpriseTakeBpsMin        Int      @default(1200) // 12%
+  enterpriseTakeBpsMax        Int      @default(1500) // 15%
+  enterpriseTakeBpsDefault    Int      @default(1300) // 13% blended (whitepaper worked example)
+  saasFeeCentsPerSiteMonth    Int      @default(75000) // €750/site/month
+  vatBps                      Int      @default(1900)
+  isActive                    Boolean  @default(true)
+  updatedByUserId             String?
+  updatedAt                   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String
+  entityType String
+  entityId   String?
+  meta       String?  // JSON
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@index([createdAt])
+}
